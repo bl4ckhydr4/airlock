@@ -1,0 +1,15 @@
+[Unit]
+Description=Airlock API Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/airlock-api
+ExecStart=/usr/bin/python3 /opt/airlock-api/server.py
+Restart=always
+RestartSec=5
+Environment=AIRLOCK_API_PORT=5000
+
+[Install]
+WantedBy=multi-user.target

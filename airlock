@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+#
+# airlock — Secure workspace switcher for OpenClaw/Emma
+# Usage: airlock <command> [args]
+#
+# Commands:
+#   status              Show active workspace and health
+#   seal                Seal the active workspace (hash, manifest, archive)
+#   unseal <name>       Load a workspace and verify integrity
+#   force-unseal <name> Load a workspace WITHOUT integrity verification
+#   agent-status        Check if the agent is running
+#   agent-stop          Stop the agent gracefully
+#   agent-start         Start the agent
+#   settings            Output current settings as JSON
+#   save-settings       Accept JSON on stdin and persist settings
+#   audit               Output audit log as JSON array
+#   workspaces          List available workspaces
+#   create <name>       Create a new empty workspace
+#   delete <name>       Delete a workspace (must be sealed)
+
+set -euo pipefail
+
+# ─── CONFIGURATION ───────────────────────────────────────────────
+WORKSPACE_ROOT="${HOME}/.openclaw"
+ACTIVE_LINK="${WORKSPACE_ROOT}/workspace"
+ARCHIVE_DIR="${WORKSPACE_ROOT}/airlock-archives"
+MANIFEST_DIR="${WORKSPACE_ROOT}/airlock-manifests"
+AUDIT_FILE="${WORKSPACE_ROOT}/airlock-audit.jsonl"
+SETTINGS_FILE="${WORKSPACE_ROOT}/airlock-settings.json"
+AGENT_CONFIG="${WORKSPACE_ROOT}/airlock-agent.conf"
+
+# ─── HELPERS ────────────────────────────────────────────────────
+
+json_escape() {
+  sed 's/\\/\\\\/g; s/"/\\"/g' <<< "$1"
+}
+
+timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+check_agent_running() {
+  # First check the configured status command if available
+  if [ -f "$AGENT_CONFIG" ]; then
+    source "$AGENT_CONFIG"
+    if [ -n "${AGENT_STATUS:-}" ]; then
+      local result
+      result=$(eval "$AGENT_STATUS" 2>/dev/null)
+      if echo "$result" | grep -qiE "active|running|online"; then
+        return 0
+      else
+        return 1
+      fi
+    fi
+  fi
+
+  # Fallback: check common process names
+  for proc_name in openclaw emma openclaw-runtime; do
+    if pgrep -f "$proc_name" > /dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+get_active_workspace() {
+  if [ -L "$ACTIVE_LINK" ] && [ -e "$ACTIVE_LINK" ]; then
+    basename "$(readlink -f "$ACTIVE_LINK")"
+  else
+    echo ""
+  fi
+}
+
+get_available_workspaces() {
+  for dir in "${WORKSPACE_ROOT}"/workspace-* "${WORKSPACE_ROOT}"/scopex "${WORKSPACE_ROOT}"/legal; do
+    [ -d "$dir" ] || continue
+    local name=$(basename "$dir" | sed 's/^workspace-//')
+    echo "$name"
+  done | sort -u
+}
+
+load_settings() {
+  if [ -f "$SETTINGS_FILE" ]; then
+    cat "$SETTINGS_FILE"
+  else
+    echo '{"auto_commit": false, "auto_push": false, "remote_name": "origin"}'
+  fi
+}
+
+write_audit() {
+  local action="$1"
+  local workspace="$2"
+  local status="$3"
+  local extra="${4:-{}}"
+  local entry=$(jq -n \
+    --arg action "$action" \
+    --arg workspace "$workspace" \
+    --arg status "$status" \
+    --arg timestamp "$(timestamp)" \
+    --argjson extra "$extra" \
+    '{action: $action, workspace: $workspace, status: $status, timestamp: $timestamp} + $extra')
+  echo "$entry" >> "$AUDIT_FILE"
+}
+
+hash_workspace() {
+  local dir="$1"
+  local manifest="{}"
+  while IFS= read -r -d '' file; do
+    local rel="${file#$dir/}"
+    [[ "$rel" == .git/* ]] && continue
+    [[ "$rel" == airlock-* ]] && continue
+    [[ "$(basename "$file")" == ".DS_Store" ]] && continue
+    local hash=$(sha256sum "$file" | awk '{print $1}')
+    manifest=$(echo "$manifest" | jq --arg path "$rel" --arg hash "$hash" '.files[$path] = $hash')
+  done < <(find "$dir" -type f -print0 2>/dev/null)
+  local count=$(echo "$manifest" | jq '.files | length')
+  echo "$manifest" | jq --arg count "$count" --arg ts "$(timestamp)" '. + {sealed_at: $ts, file_count: ($count | tonumber)}'
+}
+
+verify_manifest() {
+  local dir="$1"
+  local manifest_file="$2"
+  local mismatches="[]"
+  local matched=0
+  local total=0
+
+  while IFS="=" read -r file expected_hash; do
+    total=$((total + 1))
+    local full_path="${dir}/${file}"
+    if [ -f "$full_path" ]; then
+      local actual_hash=$(sha256sum "$full_path" | awk '{print $1}')
+      if [ "$actual_hash" = "$expected_hash" ]; then
+        matched=$((matched + 1))
+      else
+        mismatches=$(echo "$mismatches" | jq --arg file "$file" --arg expected "$expected_hash" --arg got "$actual_hash" \
+          '. + [{file: $file, expected: $expected, got: $got}]')
+      fi
+    else
+      mismatches=$(echo "$mismatches" | jq --arg file "$file" --arg expected "$expected_hash" --arg got "MISSING" \
+        '. + [{file: $file, expected: $expected, got: $got}]')
+    fi
+  done < <(jq -r '.files | to_entries[] | "\(.key)=\(.value)"' "$manifest_file")
+
+  echo "$matched" "$total" "$mismatches"
+}
+
+git_status() {
+  local dir="$1"
+  if [ -d "${dir}/.git" ]; then
+    local branch=$(GIT_DIR="${dir}/.git" git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    local clean="true"
+    if [ -n "$(GIT_DIR="${dir}/.git" git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+      clean="false"
+    fi
+    local last_commit=$(GIT_DIR="${dir}/.git" git -C "$dir" log -1 --pretty=%s 2>/dev/null || echo "")
+    jq -n --arg branch "$branch" --argjson clean "$clean" --arg commit "$last_commit" \
+      '{branch: $branch, clean: $clean, last_commit: $commit}'
+  else
+    echo 'null'
+  fi
+}
+
+# ─── AGENT LIFECYCLE ────────────────────────────────────────────
+
+agent_status() {
+  if check_agent_running; then
+    echo "running"
+  else
+    echo "stopped"
+  fi
+}
+
+agent_stop() {
+  if [ -f "$AGENT_CONFIG" ]; then
+    source "$AGENT_CONFIG"
+    if [ -n "${AGENT_STOP:-}" ]; then
+      eval "$AGENT_STOP"
+      sleep 1
+    fi
+  fi
+  # Fallback: try to kill known process
+  for proc_name in openclaw emma openclaw-runtime; do
+    pkill -f "$proc_name" 2>/dev/null || true
+  done
+}
+
+agent_start() {
+  if [ -f "$AGENT_CONFIG" ]; then
+    source "$AGENT_CONFIG"
+    if [ -n "${AGENT_START:-}" ]; then
+      eval "$AGENT_START"
+      return
+    fi
+  fi
+  echo "No agent start hook configured. Start the agent manually."
+}
+
+# ─── COMMAND: status ────────────────────────────────────────────
+
+cmd_status() {
+  local active=$(get_active_workspace)
+  local healthy=true
+  local files=0
+  local last_seal=""
+
+  if [ -n "$active" ]; then
+    local source_dir="${WORKSPACE_ROOT}/${active}"
+    local manifest="${MANIFEST_DIR}/${active}.manifest.json"
+    if [ -f "$manifest" ]; then
+      read matched total mismatches < <(verify_manifest "$source_dir" "$manifest")
+      files=$total
+      if [ "$(echo "$mismatches" | jq 'length')" -gt 0 ]; then
+        healthy=false
+      fi
+      last_seal=$(jq -r '.sealed_at' "$manifest")
+    fi
+  fi
+
+  local git_info=$(git_status "$(readlink -f "$ACTIVE_LINK" 2>/dev/null || echo "$WORKSPACE_ROOT/${active}")")
+  local agent_running=false
+  check_agent_running && agent_running=true
+
+  jq -n \
+    --arg active "$active" \
+    --argjson healthy "$healthy" \
+    --argjson files "$files" \
+    --arg last_sealed "$last_seal" \
+    --argjson git_status "$git_info" \
+    --argjson agent_running "$agent_running" \
+    '{active: $active, healthy: $healthy, files: $files, last_sealed_manifest: $last_sealed, git_status: $git_status, agent_running: $agent_running}'
+}
+
+# ─── COMMAND: seal ──────────────────────────────────────────────
+
+cmd_seal() {
+  local active=$(get_active_workspace)
+
+  if [ -z "$active" ]; then
+    jq -n '{sealed: false, workspace: "", error: "NO_ACTIVE_WORKSPACE", message: "No active workspace found to seal."}'
+    exit 1
+  fi
+
+  # Check for running agent
+  if check_agent_running; then
+    jq -n --arg ws "$active" '{sealed: false, workspace: $ws, error: "AGENT_RUNNING", message: "Cannot seal: agent process detected. Stop the agent first."}'
+    exit 1
+  fi
+
+  local source_dir="${WORKSPACE_ROOT}/${active}"
+  local datestamp=$(date +"%Y%m%d-%H%M%S")
+  local archive_name="workspace-${active}-${datestamp}.tar.gz"
+  local archive_path="${ARCHIVE_DIR}/${archive_name}"
+  local manifest_path="${MANIFEST_DIR}/${active}.manifest.json"
+  local settings=$(load_settings)
+  local auto_commit=$(echo "$settings" | jq -r '.auto_commit')
+  local auto_push=$(echo "$settings" | jq -r '.auto_push')
+  local remote_name=$(echo "$settings" | jq -r '.remote_name')
+
+  mkdir -p "$ARCHIVE_DIR" "$MANIFEST_DIR"
+
+  # Auto-commit if enabled and dirty
+  if [ "$auto_commit" = "true" ] && [ -d "${source_dir}/.git" ]; then
+    if [ -n "$(git -C "$source_dir" status --porcelain 2>/dev/null)" ]; then
+      git -C "$source_dir" add -A > /dev/null 2>&1
+      git -C "$source_dir" commit -m "airlock: auto-commit before seal $(datestamp)" > /dev/null 2>&1 || true
+    fi
+  fi
+
+  # Hash all files and write manifest
+  local manifest=$(hash_workspace "$source_dir")
+  echo "$manifest" > "$manifest_path"
+
+  # Create archive
+  tar -czf "$archive_path" -C "$WORKSPACE_ROOT" "$active" > /dev/null 2>&1
+
+  # Verify archive was created
+  if [ ! -f "$archive_path" ]; then
+    jq -n '{sealed: false, workspace: "'"$active"'", error: "ARCHIVE_FAILED", message: "Failed to create archive."}'
+    exit 1
+  fi
+
+  local file_count=$(echo "$manifest" | jq -r '.file_count')
+  local checksums=$(echo "$manifest" | jq -r '.files | length')
+
+  # Remove the active symlink (workspace is now sealed)
+  rm -f "$ACTIVE_LINK"
+
+  # Auto-push if enabled
+  if [ "$auto_push" = "true" ] && [ -d "${source_dir}/.git" ]; then
+    git -C "$source_dir" push "$remote_name" > /dev/null 2>&1 || true
+  fi
+
+  write_audit "seal" "$active" "success" "$(jq -n --argjson files "$file_count" '{file_count: $files}')"
+
+  jq -n \
+    --arg ws "$active" \
+    --arg archive "$archive_name" \
+    --argjson checksums "$checksums" \
+    '{sealed: true, workspace: $ws, archive_name: $archive, manifest_checksums: $checksums, message: "Workspace sealed successfully."}'
+}
+
+# ─── COMMAND: unseal ────────────────────────────────────────────
+
+cmd_unseal() {
+  local target="${1:-}"
+  local force="${2:-false}"
+
+  if [ -z "$target" ]; then
+    jq -n '{unsealed: false, workspace: "", error: "MISSING_TARGET", message: "No target workspace specified."}'
+    exit 1
+  fi
+
+  # Check for running agent
+  if check_agent_running; then
+    jq -n --arg ws "$target" '{unsealed: false, workspace: $ws, error: "AGENT_RUNNING", message: "Cannot unseal: agent process detected. Stop the agent first."}'
+    exit 1
+  fi
+
+  # Ensure no active workspace
+  local active=$(get_active_workspace)
+  if [ -n "$active" ]; then
+    jq -n --arg active "$active" '{unsealed: false, workspace: "'"$target"'", error: "WORKSPACE_ACTIVE", message: "Workspace \($active) is still active. Seal it first."}'
+    exit 1
+  fi
+
+  local source_dir="${WORKSPACE_ROOT}/${target}"
+
+  # Check if workspace exists
+  if [ ! -d "$source_dir" ]; then
+    # Try to restore from archive
+    local latest_archive=$(ls -t "${ARCHIVE_DIR}"/"workspace-${target}"-*.tar.gz 2>/dev/null | head -1)
+    if [ -n "$latest_archive" ] && [ -f "$latest_archive" ]; then
+      mkdir -p "$source_dir"
+      tar -xzf "$latest_archive" -C "$WORKSPACE_ROOT" > /dev/null 2>&1
+    else
+      jq -n '{unsealed: false, workspace: "'"$target"'", error: "NOT_FOUND", message: "Workspace \($target) not found and no archive available."}'
+      exit 1
+    fi
+  fi
+
+  # Integrity check (skip if forced)
+  local manifest_path="${MANIFEST_DIR}/${target}.manifest.json"
+  if [ "$force" != "true" ] && [ -f "$manifest_path" ]; then
+    read matched total mismatches < <(verify_manifest "$source_dir" "$manifest_path")
+    local mismatch_count=$(echo "$mismatches" | jq 'length')
+
+    if [ "$mismatch_count" -gt 0 ]; then
+      write_audit "unseal" "$target" "failed" "$(jq -n --argjson files "$total" --argjson failed "$mismatch_count" '{file_count: $files, files_failed: $failed}')"
+      jq -n \
+        --arg ws "$target" \
+        --argjson matched "$matched" \
+        --argjson mismatches "$mismatches" \
+        '{unsealed: false, workspace: $ws, integrity_verified: false, files_matched: $matched, mismatches: $mismatches, message: "Integrity check FAILED. Workspace not activated. Use --force to override."}'
+      exit 1
+    fi
+  fi
+
+  # Create symlink to activate workspace
+  ln -sfn "$source_dir" "$ACTIVE_LINK"
+
+  # Start agent if config exists
+  agent_start
+
+  local manifest_info="{}"
+  if [ -f "$manifest_path" ]; then
+    local file_count=$(jq -r '.file_count' "$manifest_path")
+    manifest_info=$(jq -n --argjson files "$file_count" '{file_count: $files}')
+  fi
+
+  write_audit "unseal" "$target" "success" "$manifest_info"
+
+  if [ "$force" = "true" ]; then
+    write_audit "force_load" "$target" "warning" "$manifest_info"
+    jq -n \
+      --arg ws "$target" \
+      '{unsealed: true, workspace: $ws, integrity_verified: false, forced: true, message: "Workspace activated with forced override. Integrity NOT guaranteed."}'
+  else
+    jq -n \
+      --arg ws "$target" \
+      '{unsealed: true, workspace: $ws, integrity_verified: true, files_matched: '"${matched:-0}"', message: "Workspace activated. Green light."}'
+  fi
+}
+
+# ─── COMMAND: force-unseal ──────────────────────────────────────
+
+cmd_force_unseal() {
+  cmd_unseal "$1" "true"
+}
+
+# ─── COMMAND: agent-status ─────────────────────────────────────
+
+cmd_agent_status() {
+  local running=false
+  check_agent_running && running=true
+  jq -n --argjson running "$running" '{running: $running}'
+}
+
+# ─── COMMAND: agent-stop ───────────────────────────────────────
+
+cmd_agent_stop() {
+  agent_stop
+  sleep 1
+  if check_agent_running; then
+    jq -n '{stopped: false, message: "Agent may still be running."}'
+    exit 1
+  else
+    jq -n '{stopped: true, message: "Agent stopped."}'
+  fi
+}
+
+# ─── COMMAND: agent-start ──────────────────────────────────────
+
+cmd_agent_start() {
+  agent_start
+  sleep 1
+  if check_agent_running; then
+    jq -n '{started: true, message: "Agent started."}'
+  else
+    jq -n '{started: false, message: "Agent failed to start. Check agent config."}'
+    exit 1
+  fi
+}
+
+# ─── COMMAND: settings ──────────────────────────────────────────
+
+cmd_settings() {
+  load_settings
+}
+
+# ─── COMMAND: save-settings ─────────────────────────────────────
+
+cmd_save_settings() {
+  local input=$(cat)
+  echo "$input" | jq '.' > "$SETTINGS_FILE" 2>/dev/null || {
+    jq -n '{saved: false, error: "INVALID_JSON", message: "Invalid JSON input."}'
+    exit 1
+  }
+  jq -n '{saved: true, message: "Settings saved."}'
+}
+
+# ─── COMMAND: audit ─────────────────────────────────────────────
+
+cmd_audit() {
+  if [ -f "$AUDIT_FILE" ]; then
+    local entries="["
+    local first=true
+    while IFS= read -r line; do
+      if [ -n "$line" ]; then
+        if [ "$first" = true ]; then
+          entries+="$line"
+          first=false
+        else
+          entries+=",$line"
+        fi
+      fi
+    done < "$AUDIT_FILE"
+    entries+="]"
+    echo "$entries"
+  else
+    echo "[]"
+  fi
+}
+
+# ─── COMMAND: workspaces ────────────────────────────────────────
+
+cmd_workspaces() {
+  local active=$(get_active_workspace)
+  local result="["
+  local first=true
+  while IFS= read -r ws; do
+    [ -z "$ws" ] && continue
+    local is_active="false"
+    [ "$ws" = "$active" ] && is_active="true"
+    local entry=$(jq -n --arg key "$ws" --arg name "$ws" --argjson active "$is_active" \
+      '{key: $key, name: $name, active: $active}')
+    if [ "$first" = true ]; then
+      result+="$entry"
+      first=false
+    else
+      result+=",$entry"
+    fi
+  done < <(get_available_workspaces)
+  result+="]"
+  echo "$result"
+}
+
+# ─── COMMAND: create ────────────────────────────────────────────
+
+cmd_create() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    jq -n '{created: false, error: "MISSING_NAME", message: "No workspace name specified."}'
+    exit 1
+  fi
+  local dir="${WORKSPACE_ROOT}/${name}"
+  if [ -d "$dir" ]; then
+    jq -n --arg name "$name" '{created: false, error: "ALREADY_EXISTS", message: "Workspace \($name) already exists."}'
+    exit 1
+  fi
+  mkdir -p "$dir/memory"
+  echo "# ${name} Workspace" > "$dir/AGENTS.md"
+  echo "# SOUL.md" > "$dir/SOUL.md"
+  echo "# IDENTITY.md" > "$dir/IDENTITY.md"
+  echo "# USER.md" > "$dir/USER.md"
+  jq -n --arg name "$name" '{created: true, workspace: $name, message: "Workspace created."}'
+}
+
+# ─── COMMAND: delete ────────────────────────────────────────────
+
+cmd_delete() {
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    jq -n '{deleted: false, error: "MISSING_TARGET", message: "No workspace specified."}'
+    exit 1
+  fi
+  local active=$(get_active_workspace)
+  if [ "$target" = "$active" ]; then
+    jq -n --arg name "$target" '{deleted: false, error: "ACTIVE_WORKSPACE", message: "Cannot delete active workspace."}'
+    exit 1
+  fi
+  local dir="${WORKSPACE_ROOT}/${target}"
+  if [ ! -d "$dir" ]; then
+    jq -n --arg name "$target" '{deleted: false, error: "NOT_FOUND", message: "Workspace \($name) not found."}'
+    exit 1
+  fi
+  # Archive before deleting
+  local datestamp=$(date +"%Y%m%d-%H%M%S")
+  local archive_name="workspace-${target}-${datestamp}.tar.gz"
+  mkdir -p "$ARCHIVE_DIR"
+  tar -czf "${ARCHIVE_DIR}/${archive_name}" -C "$WORKSPACE_ROOT" "$target" > /dev/null 2>&1
+  rm -rf "$dir"
+  write_audit "delete" "$target" "success" "{}"
+  jq -n --arg name "$target" '{deleted: true, workspace: $name, message: "Workspace deleted and archived."}'
+}
+
+# ─── ROUTER ─────────────────────────────────────────────────────
+
+mkdir -p "$ARCHIVE_DIR" "$MANIFEST_DIR"
+touch "$AUDIT_FILE"
+
+case "${1:-}" in
+  status)
+    cmd_status
+    ;;
+  seal)
+    cmd_seal
+    ;;
+  unseal)
+    cmd_unseal "${2:-}"
+    ;;
+  force-unseal)
+    cmd_force_unseal "${2:-}"
+    ;;
+  agent-status)
+    cmd_agent_status
+    ;;
+  agent-stop)
+    cmd_agent_stop
+    ;;
+  agent-start)
+    cmd_agent_start
+    ;;
+  settings)
+    cmd_settings
+    ;;
+  save-settings)
+    cmd_save_settings
+    ;;
+  audit)
+    cmd_audit
+    ;;
+  workspaces)
+    cmd_workspaces
+    ;;
+  create)
+    cmd_create "${2:-}"
+    ;;
+  delete)
+    cmd_delete "${2:-}"
+    ;;
+  *)
+    jq -n '{error: "UNKNOWN_COMMAND", message: "Usage: airlock <status|seal|unseal|force-unseal|agent-status|agent-stop|agent-start|settings|save-settings|audit|workspaces|create|delete>"}'
+    exit 1
+    ;;
+esac
